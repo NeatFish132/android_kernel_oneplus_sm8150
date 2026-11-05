@@ -43,33 +43,45 @@
  
  #include <linux/uaccess.h>
  #include <asm/mmu_context.h>
-@@ -1711,7 +1714,7 @@
+@@ -1711,6 +1714,15 @@
  	return ret;
  }
  
--#ifdef CONFIG_KSU_MANUAL_HOOK
 +#ifdef CONFIG_KSU
- __attribute__((hot))
- extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
- 				void *argv, void *envp, int *flags);
-@@ -1733,7 +1736,7 @@
++__attribute__((hot))
++extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
++				void *argv, void *envp, int *flags);
++__attribute__((hot))
++extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
++				void *argv, void *envp, int *flags, int *retval);
++#endif
++
+ /*
+  * sys_execve() executes a new program.
+  */
+@@ -1724,6 +1736,10 @@
  	struct files_struct *displaced;
  	int retval;
  
--#ifdef CONFIG_KSU_MANUAL_HOOK
 +#ifdef CONFIG_KSU
- 	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
- #endif
++	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
++#endif
++
+ 	if (IS_ERR(filename))
+ 		return PTR_ERR(filename);
  
-@@ -1889,7 +1892,7 @@
+@@ -1875,6 +1891,11 @@
+ 	if (displaced)
  		reset_files_struct(displaced);
  out_ret:
- 
--#ifdef CONFIG_KSU_MANUAL_HOOK
++
 +#ifdef CONFIG_KSU
- 	ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
- #endif
- 
++	ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
++#endif
++
+ 	if (filename)
+ 		putname(filename);
+ 	return retval;
 --- a/fs/internal.h
 +++ b/fs/internal.h
 @@ -55,6 +55,8 @@
@@ -995,34 +1007,30 @@
  
  #include "internal.h"
  
-@@ -354,10 +357,10 @@
+@@ -354,6 +357,12 @@
  	return error;
  }
  
--#ifdef CONFIG_KSU_MANUAL_HOOK
--__attribute__((hot))
--extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
--				int *mode, int *flags);
 +#ifdef CONFIG_KSU_SUSFS
 +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
 +extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,
 +			int *__unused_flags);
- #endif
- 
++#endif
++
  /*
-@@ -374,9 +377,8 @@
+  * access() needs to use the real uid/gid, not the effective uid/gid.
+  * We do this by temporarily clearing all FS-related capabilities and
+@@ -368,6 +377,9 @@
  	struct vfsmount *mnt;
  	int res;
  	unsigned int lookup_flags = LOOKUP_FOLLOW;
--
--#ifdef CONFIG_KSU_MANUAL_HOOK
--	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
 +#ifdef CONFIG_KSU_SUSFS
 +	struct filename *fname = NULL;
- #endif
++#endif
  
  	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
-@@ -420,7 +422,21 @@
+ 		return -EINVAL;
+@@ -410,7 +422,21 @@
  
  	old_cred = override_creds(override_cred);
  retry:
@@ -1914,64 +1922,6 @@
  	if (error)
  		goto out;
  
-@@ -353,17 +422,6 @@
- 	return cp_new_stat(&stat, statbuf);
- }
- 
--#ifdef CONFIG_KSU_MANUAL_HOOK
--__attribute__((hot))
--extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
--				int *flags);
--
--extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
--#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
--extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr); // optional
--#endif
--#endif
--
- #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
- SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
- 		struct stat __user *, statbuf, int, flag)
-@@ -371,9 +429,6 @@
- 	struct kstat stat;
- 	int error;
- 
--#ifdef CONFIG_KSU_MANUAL_HOOK
--	ksu_handle_stat(&dfd, &filename, &flag);
--#endif
- 	error = vfs_fstatat(dfd, filename, &stat, flag);
- 	if (error)
- 		return error;
-@@ -389,9 +444,6 @@
- 	if (!error)
- 		error = cp_new_stat(&stat, statbuf);
- 
--#ifdef CONFIG_KSU_MANUAL_HOOK
--	ksu_handle_newfstat_ret(&fd, &statbuf);
--#endif
- 	return error;
- }
- 
-@@ -512,9 +564,6 @@
- 	if (!error)
- 		error = cp_new_stat64(&stat, statbuf);
- 
--#ifdef CONFIG_KSU_MANUAL_HOOK // for 32-bit
--	ksu_handle_fstat64_ret(&fd, &statbuf);
--#endif
- 	return error;
- }
- 
-@@ -524,9 +573,6 @@
- 	struct kstat stat;
- 	int error;
- 
--#ifdef CONFIG_KSU_MANUAL_HOOK // 32-bit su
--	ksu_handle_stat(&dfd, &filename, &flag);
--#endif
- 	error = vfs_fstatat(dfd, filename, &stat, flag);
- 	if (error)
- 		return error;
 --- a/fs/statfs.c
 +++ b/fs/statfs.c
 @@ -9,8 +9,20 @@
@@ -2116,25 +2066,27 @@
  
 --- a/kernel/reboot.c
 +++ b/kernel/reboot.c
-@@ -277,8 +277,7 @@
+@@ -277,6 +277,10 @@
   *
   * reboot doesn't sync: do that yourself before calling this.
   */
--
--#ifdef CONFIG_KSU_MANUAL_HOOK
 +#ifdef CONFIG_KSU
- extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
- #endif
- 
-@@ -289,7 +288,7 @@
++extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
++#endif
++
+ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		void __user *, arg)
+ {
+@@ -284,6 +288,9 @@
  	char buffer[256];
  	int ret = 0;
  
--#ifdef CONFIG_KSU_MANUAL_HOOK
 +#ifdef CONFIG_KSU
- 	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
- #endif
++	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
++#endif
  	/* We only trust the superuser with rebooting the system. */
+ 	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+ 		return -EPERM;
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
 @@ -587,6 +587,7 @@
