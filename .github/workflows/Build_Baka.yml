@@ -1,0 +1,868 @@
+name: OnePlus 7T Pro (hotdog) BakaSU + SUSFS v2.3.0
+# made by ChatGPT Grok Claude
+#
+# 两种模式：
+#   susfs = false  -> Stage A：仅 BakaSU，CONFIG_KSU_MANUAL_HOOK（与原工作流行为一致）
+#   susfs = true   -> Stage B：BakaSU + SUSFS v2.3.0，CONFIG_KSU_SUSFS（SuSFS Inline Hook）
+#
+# SUSFS 集成说明：
+#   - 上游 susfs4ksu 的 gki-android16-6.12 分支是 v2.3.0 的 GKI 6.12 实现，
+#     其内核补丁和 susfs.c 依赖 5.x/6.x 接口（handle_inode_event、bootconfig 等），
+#     无法直接用于 4.14。
+#   - 内核钩子：使用本仓库 susfs/4.14/ 下针对本树（4.14.357）生成的补丁，
+#     由 agate-bakasu-susfs 的 4.14 移植改写而来，并按本树的 ida_alloc API、
+#     BakaSU 钩子签名做了适配。
+#   - 核心文件（fs/susfs.c、include/linux/susfs.h、include/linux/susfs_def.h）：
+#     构建时从 agate-bakasu-susfs 固定提交拉取（v2.3.0 + Linux 4.14 适配，已实机验证），
+#     不提交进本仓库（上游 SUSFS 为 GPL-3.0，见许可证说明）。
+#   - 上游 6.12 分支固定提交仅作对照：校验 SUSFS_VERSION 一致，并输出差异报告。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bakasu_ref:
+        description: 'BakaSU 完整 40 位 commit SHA'
+        type: string
+        required: true
+
+      susfs:
+        description: '集成 SUSFS v2.3.0（关闭则为 Stage A：仅 BakaSU Manual Hook）'
+        type: boolean
+        required: false
+        default: true
+
+      localversion:
+        description: 'CONFIG_LOCALVERSION 后缀（留空：Stage A 为 -BakaSU，SUSFS 为 -BakaSU-SUSFS）'
+        type: string
+        required: false
+        default: ''
+
+      clean_build:
+        description: '清除 out/ 与 ccache 后全量编译'
+        type: boolean
+        required: false
+        default: true
+
+env:
+  DEVICE_CODENAME: hotdog
+  ARCH: arm64
+
+  CLANG_REPO: https://github.com/kdrag0n/proton-clang.git
+  CLANG_BRANCH: master
+
+  BAKASU_REPO: https://github.com/Baka-SU/BakaSU.git
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
+
+  BASE_DEFCONFIG: vendor/sm8150-perf_defconfig
+  OPLUS_FRAGMENT: arch/arm64/configs/vendor/oplus.config
+
+  # ---------------- SUSFS ----------------
+  SUSFS_EXPECTED_VERSION: v2.3.0
+
+  # 本树专用 4.14 内核钩子补丁（提交在本仓库内）
+  SUSFS_HOOK_PATCH: susfs/4.14/50_add_susfs_in_kernel-4.14-sm8150.patch
+
+  # SUSFS 核心（v2.3.0 + Linux 4.14 适配），固定到已验证提交
+  SUSFS_CORE_REPO: https://github.com/souta-lab/agate-bakasu-susfs.git
+  SUSFS_CORE_REF: a5b81689cce322729342bf51bab6ca5affcebebf
+
+  # 上游 susfs4ksu gki-android16-6.12，仅用于版本校验与差异报告
+  SUSFS_UPSTREAM_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_UPSTREAM_BRANCH: gki-android16-6.12
+  SUSFS_UPSTREAM_REF: 6b60a305d418148bd311f4fc9bddedc82d99e1fc
+
+concurrency:
+  group: build-baka-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ inputs.susfs && 'Stage B - BakaSU + SUSFS v2.3.0 (SuSFS Inline Hook)' || 'Stage A - BakaSU (Manual Hook)' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    env:
+      BAKASU_REF: ${{ inputs.bakasu_ref }}
+      SUSFS_ENABLE: ${{ inputs.susfs }}
+      LOCALVERSION_INPUT: ${{ inputs.localversion }}
+      CLEAN_BUILD: ${{ inputs.clean_build }}
+
+    steps:
+      # --------------------------------------------------
+      # 1. Validate inputs
+      # --------------------------------------------------
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+
+          if ! [[ "${BAKASU_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::bakasu_ref 必须是完整的 40 位 commit SHA"
+            exit 1
+          fi
+
+          if [[ -n "${LOCALVERSION_INPUT}" ]] &&
+             ! [[ "${LOCALVERSION_INPUT}" =~ ^[-a-zA-Z0-9._+]+$ ]]; then
+            echo "::error::localversion 只允许字母、数字、点、下划线、加号和连字符"
+            exit 1
+          fi
+
+          for v in SUSFS_CORE_REF SUSFS_UPSTREAM_REF; do
+            if ! [[ "${!v}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::${v} 必须是完整的 40 位 commit SHA"
+              exit 1
+            fi
+          done
+
+          if [ "${SUSFS_ENABLE}" = "true" ]; then
+            echo "BUILD_STAGE=B" >> "${GITHUB_ENV}"
+            echo "Mode: Stage B (BakaSU + SUSFS ${SUSFS_EXPECTED_VERSION})"
+          else
+            echo "BUILD_STAGE=A" >> "${GITHUB_ENV}"
+            echo "Mode: Stage A (BakaSU only)"
+          fi
+
+      # --------------------------------------------------
+      # 2. Checkout kernel source
+      # --------------------------------------------------
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Record kernel SHA
+        run: |
+          set -euo pipefail
+
+          KERNEL_SHA="$(git rev-parse HEAD)"
+
+          echo "KERNEL_SHA=${KERNEL_SHA}" >> "${GITHUB_ENV}"
+          echo "Kernel SHA=${KERNEL_SHA}"
+
+      # --------------------------------------------------
+      # 3. Install dependencies
+      # --------------------------------------------------
+
+      - name: Free disk space & install dependencies
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL || true
+
+          sudo apt-get update
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            cpio \
+            xz-utils \
+            lz4 \
+            zstd \
+            rsync \
+            kmod \
+            zip \
+            unzip \
+            ccache \
+            device-tree-compiler \
+            libxml2-utils \
+            python3 \
+            dwarves \
+            build-essential \
+            git \
+            curl \
+            ca-certificates
+
+      # --------------------------------------------------
+      # 4. Cache Clang
+      # --------------------------------------------------
+
+      - name: Cache Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: toolchain/clang
+          key: clang-proton-${{ env.CLANG_BRANCH }}-v1
+
+      - name: Download Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          mkdir -p toolchain
+
+          git clone \
+            --depth=1 \
+            -b "${CLANG_BRANCH}" \
+            "${CLANG_REPO}" \
+            toolchain/clang
+
+      - name: Setup PATH & record Clang
+        run: |
+          set -euo pipefail
+
+          if [ ! -x toolchain/clang/bin/clang ]; then
+            echo "::error::Clang binary not found"
+            exit 1
+          fi
+
+          echo "${GITHUB_WORKSPACE}/toolchain/clang/bin" >> "${GITHUB_PATH}"
+
+          CLANG_VERSION="$(toolchain/clang/bin/clang --version | head -n1)"
+          CLANG_SHA="$(git -C toolchain/clang rev-parse HEAD)"
+
+          echo "CLANG_SHA=${CLANG_SHA}" >> "${GITHUB_ENV}"
+
+          echo "Clang version: ${CLANG_VERSION}"
+          echo "Clang SHA: ${CLANG_SHA}"
+
+      # --------------------------------------------------
+      # 5. Restore ccache
+      # --------------------------------------------------
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-stage-${{ inputs.susfs && 'b' || 'a' }}-${{ env.DEVICE_CODENAME }}-${{ github.sha }}
+          restore-keys: |
+            ccache-stage-${{ inputs.susfs && 'b' || 'a' }}-${{ env.DEVICE_CODENAME }}-
+
+      - name: Setup ccache
+        run: |
+          set -euo pipefail
+
+          export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+          export CCACHE_MAXSIZE=2G
+          export CCACHE_COMPILERCHECK=content
+
+          echo "CCACHE_DIR=${CCACHE_DIR}" >> "${GITHUB_ENV}"
+          echo "CCACHE_MAXSIZE=${CCACHE_MAXSIZE}" >> "${GITHUB_ENV}"
+          echo "CCACHE_COMPILERCHECK=${CCACHE_COMPILERCHECK}" >> "${GITHUB_ENV}"
+
+          mkdir -p "${CCACHE_DIR}"
+
+          if [ "${CLEAN_BUILD}" = "true" ]; then
+            echo "Clean build enabled: removing out/ and ccache"
+
+            rm -rf "${CCACHE_DIR}" out
+
+            mkdir -p "${CCACHE_DIR}"
+          fi
+
+          ccache -z
+
+      # --------------------------------------------------
+      # 6. Integrate SUSFS v2.3.0 (Stage B only)
+      # --------------------------------------------------
+
+      - name: Integrate SUSFS - apply 4.14 kernel hooks
+        if: env.SUSFS_ENABLE == 'true'
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${SUSFS_HOOK_PATCH}" ]; then
+            echo "::error::未找到 ${SUSFS_HOOK_PATCH}"
+            exit 1
+          fi
+
+          if [ -e fs/susfs.c ] || [ -e include/linux/susfs.h ] ||
+             grep -q 'CONFIG_KSU_SUSFS' fs/namespace.c; then
+            echo "::error::源码树中已存在 SUSFS 相关内容，拒绝重复集成"
+            exit 1
+          fi
+
+          # 严格应用：不允许 fuzz / offset 之外的偏差
+          git apply --check --verbose "${SUSFS_HOOK_PATCH}"
+          git apply --verbose "${SUSFS_HOOK_PATCH}"
+
+          # 应用后检查：BakaSU SuSFS Inline Hook 必需的 7 个钩子
+          declare -A REQUIRED=(
+            [kernel/sys.c]=ksu_handle_setresuid
+            [fs/exec.c]=ksu_handle_execveat
+            [fs/open.c]=ksu_handle_faccessat
+            [fs/read_write.c]=ksu_handle_sys_read
+            [fs/stat.c]=ksu_handle_stat
+            [kernel/reboot.c]=ksu_handle_sys_reboot
+            [drivers/input/input.c]=ksu_handle_input_handle_event
+          )
+          for f in "${!REQUIRED[@]}"; do
+            grep -q "${REQUIRED[$f]}" "$f" || {
+              echo "::error::${f} 缺少 ${REQUIRED[$f]}"
+              exit 1
+            }
+          done
+
+          # SUSFS 模式下不应残留 Manual Hook 守卫
+          if grep -ln 'CONFIG_KSU_MANUAL_HOOK' "${!REQUIRED[@]}"; then
+            echo "::error::以上文件仍有 CONFIG_KSU_MANUAL_HOOK 守卫，SUSFS 模式下钩子不会被编译"
+            exit 1
+          fi
+
+          PATCH_SHA256="$(sha256sum "${SUSFS_HOOK_PATCH}" | cut -d' ' -f1)"
+          echo "SUSFS_HOOK_PATCH_SHA256=${PATCH_SHA256}" >> "${GITHUB_ENV}"
+          echo "SUSFS hook patch applied (sha256=${PATCH_SHA256})"
+
+      - name: Integrate SUSFS - fetch v2.3.0 core (4.14 port)
+        if: env.SUSFS_ENABLE == 'true'
+        run: |
+          set -euo pipefail
+
+          CORE_DIR=/tmp/susfs-core
+
+          rm -rf "${CORE_DIR}"
+          git init -q "${CORE_DIR}"
+          git -C "${CORE_DIR}" remote add origin "${SUSFS_CORE_REPO}"
+          git -C "${CORE_DIR}" fetch --depth=1 --filter=blob:none origin "${SUSFS_CORE_REF}"
+          git -C "${CORE_DIR}" sparse-checkout set --no-cone \
+            /fs/susfs.c \
+            /include/linux/susfs.h \
+            /include/linux/susfs_def.h
+          git -C "${CORE_DIR}" checkout -q --detach FETCH_HEAD
+
+          ACTUAL="$(git -C "${CORE_DIR}" rev-parse HEAD)"
+          if [ "${ACTUAL}" != "${SUSFS_CORE_REF}" ]; then
+            echo "::error::SUSFS core commit mismatch: ${ACTUAL}"
+            exit 1
+          fi
+
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ ! -s "${CORE_DIR}/${f}" ]; then
+              echo "::error::SUSFS core 缺少 ${f}"
+              exit 1
+            fi
+            install -m 0644 "${CORE_DIR}/${f}" "${f}"
+            echo "  ${f}  $(sha256sum "${f}" | cut -d' ' -f1)"
+          done
+
+          VER="$(sed -n 's/^#define[[:space:]]\+SUSFS_VERSION[[:space:]]\+"\([^"]*\)".*/\1/p' include/linux/susfs.h)"
+          if [ "${VER}" != "${SUSFS_EXPECTED_VERSION}" ]; then
+            echo "::error::SUSFS 核心版本为 ${VER:-unknown}，期望 ${SUSFS_EXPECTED_VERSION}"
+            exit 1
+          fi
+
+          # 4.14 适配的关键标志：4.14 fsnotify 只有 handle_event（10 参数），
+          # 适配版会为 < 5.1 内核提供 .handle_event 回调
+          if ! grep -q '\.handle_event[[:space:]]*=' fs/susfs.c; then
+            echo "::error::fs/susfs.c 缺少 4.14 fsnotify .handle_event 适配，可能不是 4.14 移植版"
+            exit 1
+          fi
+
+          grep -q 'obj-$(CONFIG_KSU_SUSFS)' fs/Makefile || {
+            echo "::error::fs/Makefile 未加入 susfs.o"
+            exit 1
+          }
+
+          echo "SUSFS_CORE_VERSION=${VER}" >> "${GITHUB_ENV}"
+          echo "SUSFS core ${VER} @ ${ACTUAL}"
+
+      - name: SUSFS - compare with upstream gki-android16-6.12 (reference only)
+        if: env.SUSFS_ENABLE == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          UP=/tmp/susfs4ksu
+          mkdir -p out/susfs-report
+
+          rm -rf "${UP}"
+          git init -q "${UP}"
+          git -C "${UP}" remote add origin "${SUSFS_UPSTREAM_REPO}"
+          git -C "${UP}" fetch --depth=1 origin "${SUSFS_UPSTREAM_REF}"
+          git -C "${UP}" checkout -q --detach FETCH_HEAD
+
+          UP_VER="$(sed -n 's/^#define[[:space:]]\+SUSFS_VERSION[[:space:]]\+"\([^"]*\)".*/\1/p' \
+            "${UP}/kernel_patches/include/linux/susfs.h")"
+          echo "SUSFS_UPSTREAM_VERSION=${UP_VER}" >> "${GITHUB_ENV}"
+
+          if [ "${UP_VER}" != "${SUSFS_CORE_VERSION}" ]; then
+            echo "::warning::上游 ${SUSFS_UPSTREAM_BRANCH} 版本为 ${UP_VER}，本次使用的 4.14 核心为 ${SUSFS_CORE_VERSION}"
+          fi
+
+          # 核心文件差异（上游 6.12 -> 本次使用的 4.14 核心），供后续同步上游修复时参考
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            diff -u \
+              --label "upstream-6.12/${f}" "${UP}/kernel_patches/${f}" \
+              --label "4.14-core/${f}" "${f}" || true
+          done > out/susfs-report/core-upstream-vs-414.diff
+
+          # 上游自上次核对以来是否有新提交（仅提示）
+          LATEST="$(git ls-remote "${SUSFS_UPSTREAM_REPO}" "refs/heads/${SUSFS_UPSTREAM_BRANCH}" | cut -f1 || true)"
+          {
+            echo "upstream_branch=${SUSFS_UPSTREAM_BRANCH}"
+            echo "upstream_pinned=${SUSFS_UPSTREAM_REF}"
+            echo "upstream_latest=${LATEST:-unknown}"
+            echo "upstream_version=${UP_VER}"
+            echo "core_repo=${SUSFS_CORE_REPO}"
+            echo "core_ref=${SUSFS_CORE_REF}"
+            echo "core_version=${SUSFS_CORE_VERSION}"
+          } > out/susfs-report/versions.txt
+          cat out/susfs-report/versions.txt
+
+          if [ -n "${LATEST}" ] && [ "${LATEST}" != "${SUSFS_UPSTREAM_REF}" ]; then
+            echo "::notice::上游 ${SUSFS_UPSTREAM_BRANCH} 已有新提交 ${LATEST}，如需同步请人工评估后移植到 4.14"
+          fi
+
+          echo "Delta lines: $(grep -c '^[-+][^-+]' out/susfs-report/core-upstream-vs-414.diff || true)"
+
+      # --------------------------------------------------
+      # 7. Integrate BakaSU
+      # --------------------------------------------------
+
+      - name: Integrate BakaSU
+        run: |
+          set -euo pipefail
+
+          echo "Requested BakaSU commit: ${BAKASU_REF}"
+
+          git clone "${BAKASU_REPO}" /tmp/bakasu
+
+          git -C /tmp/bakasu checkout --detach "${BAKASU_REF}"
+
+          BAKASU_SOURCE_SHA="$(git -C /tmp/bakasu rev-parse HEAD)"
+
+          if [ "${BAKASU_SOURCE_SHA}" != "${BAKASU_REF}" ]; then
+            echo "::error::BakaSU source commit mismatch"
+            exit 1
+          fi
+
+          if [ ! -f /tmp/bakasu/kernel/setup.sh ]; then
+            echo "::error::BakaSU 仓库中不存在 kernel/setup.sh"
+            exit 1
+          fi
+
+          if [ "${SUSFS_ENABLE}" = "true" ]; then
+            # BakaSU 需要提供 SuSFS Inline Hook 选项，并且不能带有
+            # 旧版 susfs_compat.mk 中“please wait susfs update”的硬拦截
+            if ! grep -q '^config KSU_SUSFS$' /tmp/bakasu/kernel/Kconfig; then
+              echo "::error::该 BakaSU 提交不支持 CONFIG_KSU_SUSFS"
+              exit 1
+            fi
+            if grep -qs 'wait susfs update' /tmp/bakasu/kernel/tools/susfs_compat.mk; then
+              echo "::error::该 BakaSU 提交的 susfs_compat.mk 会无条件拒绝 SUSFS，请换用更新的 BakaSU 提交"
+              exit 1
+            fi
+          fi
+
+          echo "Running BakaSU kernel setup..."
+
+          bash /tmp/bakasu/kernel/setup.sh "${BAKASU_REF}"
+
+          if [ ! -d KernelSU ] || [ ! -d KernelSU/.git ]; then
+            echo "::error::setup 后未找到带 .git 的 KernelSU 目录"
+            exit 1
+          fi
+
+          ACTUAL="$(git -C KernelSU rev-parse HEAD)"
+
+          if ! EXPECTED="$(git -C KernelSU rev-parse --verify "${BAKASU_REF}^{commit}" 2>/dev/null)"; then
+            echo "::error::无法在 KernelSU 仓库解析指定 commit"
+            echo "Requested: ${BAKASU_REF}"
+            echo "Actual: ${ACTUAL}"
+            exit 1
+          fi
+
+          if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+            echo "::error::BakaSU integrated HEAD mismatch"
+            echo "Expected: ${EXPECTED}"
+            echo "Actual:   ${ACTUAL}"
+            exit 1
+          fi
+
+          echo "BakaSU HEAD=${ACTUAL}"
+          echo "BAKASU_HEAD=${ACTUAL}" >> "${GITHUB_ENV}"
+
+      # --------------------------------------------------
+      # 8. Generate config fragment
+      # --------------------------------------------------
+
+      - name: Generate config fragment
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+
+          LV="${LOCALVERSION_INPUT:-}"
+
+          if [ -z "${LV}" ]; then
+            if [ "${SUSFS_ENABLE}" = "true" ]; then
+              LV="-BakaSU-SUSFS"
+            else
+              LV="-BakaSU"
+            fi
+          fi
+
+          {
+            echo 'CONFIG_LOCALVERSION_AUTO=n'
+            echo 'CONFIG_DEBUG_INFO=n'
+            echo 'CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y'
+
+            echo 'CONFIG_KSU=y'
+            echo 'CONFIG_KSU_DEBUG=n'
+            echo 'CONFIG_KALLSYMS=y'
+            echo 'CONFIG_KALLSYMS_ALL=y'
+
+            if [ "${SUSFS_ENABLE}" = "true" ]; then
+              # Hook 方式三选一：SuSFS Inline Hook
+              echo '# CONFIG_KSU_MANUAL_HOOK is not set'
+              echo '# CONFIG_KSU_TRACEPOINT_HOOK is not set'
+              echo 'CONFIG_KSU_SUSFS=y'
+
+              echo 'CONFIG_KSU_SUSFS_SUS_PATH=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
+              echo 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+              echo 'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+              echo 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+              echo 'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y'
+              echo 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
+              echo 'CONFIG_KSU_SUSFS_SUS_MAP=y'
+            else
+              echo 'CONFIG_KSU_MANUAL_HOOK=y'
+            fi
+
+            echo 'CONFIG_OVERLAY_FS=y'
+
+            echo "CONFIG_LOCALVERSION=\"${LV}\""
+          } > out/extra.config
+
+          echo "LOCALVERSION=${LV}" >> "${GITHUB_ENV}"
+
+          echo "Generated extra.config:"
+          cat out/extra.config
+
+      # --------------------------------------------------
+      # 9. Prepare kernel config
+      # --------------------------------------------------
+
+      - name: Prepare defconfig (perf -> oplus -> extra)
+        run: |
+          set -euo pipefail
+
+          MK_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+          )
+
+          echo "Base defconfig: ${BASE_DEFCONFIG}"
+
+          make "${MK_ARGS[@]}" "${BASE_DEFCONFIG}"
+
+          FRAGS=()
+
+          if [ -f "${OPLUS_FRAGMENT}" ]; then
+            FRAGS+=("${OPLUS_FRAGMENT}")
+          else
+            echo "::warning::${OPLUS_FRAGMENT} 不存在，跳过"
+          fi
+
+          FRAGS+=(out/extra.config)
+
+          echo "Merging config fragments:"
+          printf ' - %s\n' "${FRAGS[@]}"
+
+          KCONFIG_CONFIG=out/.config \
+            scripts/kconfig/merge_config.sh \
+            -m \
+            -O out \
+            out/.config \
+            "${FRAGS[@]}"
+
+          # 一些日常可能用到的选项（保守添加）
+          scripts/config --file out/.config --enable CONFIG_EXFAT_FS || true
+          scripts/config --file out/.config --enable CONFIG_NTFS_FS || true
+          scripts/config --file out/.config --enable CONFIG_F2FS_FS || true
+          scripts/config --file out/.config --enable CONFIG_OVERLAY_FS || true
+          scripts/config --file out/.config --enable CONFIG_SQUASHFS || true
+          scripts/config --file out/.config --enable CONFIG_NETFILTER || true
+          scripts/config --file out/.config --enable CONFIG_IP_NF_TARGET_TTL || true
+          scripts/config --file out/.config --enable CONFIG_IP6_NF_TARGET_HL || true
+          scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS || true
+          scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS_F_FS || true
+          scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS_F_RNDIS || true
+          scripts/config --file out/.config --enable CONFIG_QCA_CLD_WLAN || true
+
+          make "${MK_ARGS[@]}" olddefconfig
+
+          echo "Checking final kernel config..."
+
+          require() {
+            grep -q "^$1=y" out/.config || {
+              echo "::error::$1 未生效"
+              grep -E '^(# )?CONFIG_KSU' out/.config || true
+              exit 1
+            }
+          }
+
+          require CONFIG_KSU
+          require CONFIG_OVERLAY_FS
+          require CONFIG_KALLSYMS_ALL
+
+          if [ "${SUSFS_ENABLE}" = "true" ]; then
+            require CONFIG_THREAD_INFO_IN_TASK
+            require CONFIG_KSU_SUSFS
+            for opt in SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG \
+                       HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG \
+                       OPEN_REDIRECT SUS_MAP; do
+              require "CONFIG_KSU_SUSFS_${opt}"
+            done
+
+            if grep -qE '^CONFIG_KSU_(MANUAL_HOOK|TRACEPOINT_HOOK)=y' out/.config; then
+              echo "::error::SUSFS 模式不能与 MANUAL_HOOK / TRACEPOINT_HOOK 共存"
+              grep -E '^CONFIG_KSU_' out/.config || true
+              exit 1
+            fi
+          else
+            require CONFIG_KSU_MANUAL_HOOK
+
+            if grep -qE '^CONFIG_KSU_(TRACEPOINT_HOOK|SUSFS)=y' out/.config; then
+              echo "::error::Stage A 不应启用 TRACEPOINT 或 SUSFS Hook"
+              grep -E '^CONFIG_KSU_' out/.config || true
+              exit 1
+            fi
+          fi
+
+          echo "----- CONFIG_KSU* -----"
+          grep -E '^CONFIG_KSU|^CONFIG_LOCALVERSION' out/.config || true
+
+          echo "----- CONFIG_OVERLAY_FS -----"
+          grep -E '^CONFIG_OVERLAY_FS' out/.config || true
+
+      # --------------------------------------------------
+      # 10. Build kernel
+      # --------------------------------------------------
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+
+          echo "Starting kernel build..."
+
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC="ccache clang" \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error" \
+            Image.gz-dtb 2>&1 | tee out/build.log
+
+          echo "----- Kernel output -----"
+
+          ls -lh out/arch/arm64/boot/
+
+          KERNEL_VERSION="$(make -s O=out kernelrelease)"
+
+          echo "KERNEL_VERSION=${KERNEL_VERSION}" >> "${GITHUB_ENV}"
+
+          echo "Kernel release: ${KERNEL_VERSION}"
+
+          echo "----- ccache statistics -----"
+
+          ccache -s
+
+      - name: Verify SUSFS in built kernel
+        if: env.SUSFS_ENABLE == 'true'
+        run: |
+          set -euo pipefail
+
+          # BakaSU 编译期钩子检查（inline_hook_check.mk）必须全部 found
+          for h in ksu_handle_setresuid ksu_handle_execveat ksu_handle_faccessat \
+                   ksu_handle_sys_read ksu_handle_stat ksu_handle_sys_reboot \
+                   ksu_handle_input_handle_event; do
+            grep -q "BakaSU/susfs_inline: ${h} found" out/build.log || {
+              echo "::error::BakaSU 钩子检查未通过：${h}"
+              exit 1
+            }
+          done
+
+          grep -q "SUSFS_VERSION: ${SUSFS_EXPECTED_VERSION}" out/build.log || {
+            echo "::error::BakaSU 未识别到 SUSFS ${SUSFS_EXPECTED_VERSION}"
+            exit 1
+          }
+
+          test -f out/fs/susfs.o || {
+            echo "::error::out/fs/susfs.o 不存在，SUSFS 未被编译"
+            exit 1
+          }
+
+          if strings out/vmlinux | grep -q "susfs is initialized! version: ${SUSFS_EXPECTED_VERSION}"; then
+            echo "vmlinux contains: susfs is initialized! version: ${SUSFS_EXPECTED_VERSION}"
+          else
+            echo "::error::vmlinux 中未找到 SUSFS ${SUSFS_EXPECTED_VERSION} 初始化字符串"
+            exit 1
+          fi
+
+      # --------------------------------------------------
+      # 11. Upload diagnostics
+      # Always upload, including failed builds
+      # --------------------------------------------------
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-${{ env.BUILD_STAGE }}-diagnostics-${{ github.run_id }}
+          path: |
+            out/.config
+            out/extra.config
+            out/build.log
+            out/susfs-report/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # --------------------------------------------------
+      # 12. Package AnyKernel3
+      # --------------------------------------------------
+
+      - name: Package AnyKernel3
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KERNEL_VERSION:-}" ]; then
+            echo "::error::KERNEL_VERSION 未设置"
+            exit 1
+          fi
+
+          if [ "${SUSFS_ENABLE}" = "true" ]; then
+            KSTRING="StageB BakaSU+SUSFS ${SUSFS_EXPECTED_VERSION} SM8150 by NeatFish132"
+          else
+            KSTRING="StageA BakaSU SM8150 by NeatFish132"
+          fi
+
+          git clone \
+            --depth=1 \
+            "${ANYKERNEL_REPO}" \
+            AnyKernel3
+
+          cd AnyKernel3
+
+          rm -rf \
+            .git \
+            .github \
+            README.md \
+            LICENSE \
+            modules \
+            patch \
+            ramdisk
+
+          if [ -f ../out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp ../out/arch/arm64/boot/Image.gz-dtb .
+          elif [ -f ../out/arch/arm64/boot/Image.gz ]; then
+            cp ../out/arch/arm64/boot/Image.gz .
+          else
+            echo "::error::未找到 Image.gz-dtb 或 Image.gz"
+            exit 1
+          fi
+
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=__KSTRING__
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=hotdog
+          device.name2=OnePlus7TPro
+          device.name3=hotdogb
+          device.name4=OnePlus7TProNR
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          sed -i "s|__KSTRING__|${KSTRING}|" anykernel.sh
+
+          ZIP="${DEVICE_CODENAME}-Stage${BUILD_STAGE}-${KERNEL_VERSION}-$(date +%Y%m%d-%H%M).zip"
+
+          zip -r9 "../${ZIP}" . -x '.git*'
+
+          echo "ZIP_NAME=${ZIP}" >> "${GITHUB_ENV}"
+
+          echo "Package created: ${ZIP}"
+
+      # --------------------------------------------------
+      # 13. Upload kernel ZIP
+      # --------------------------------------------------
+
+      - name: Upload kernel ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-${{ env.BUILD_STAGE }}-${{ env.DEVICE_CODENAME }}-${{ env.KERNEL_VERSION }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30
+          if-no-files-found: error
+
+      # --------------------------------------------------
+      # 14. Summary
+      # --------------------------------------------------
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${SUSFS_ENABLE}" = "true" ]; then
+            HOOK="CONFIG_KSU_SUSFS (SuSFS Inline Hook)"
+            SUSFS_ROW="${SUSFS_CORE_VERSION:-n/a}"
+          else
+            HOOK="CONFIG_KSU_MANUAL_HOOK"
+            SUSFS_ROW="off"
+          fi
+
+          {
+            echo "### Stage ${BUILD_STAGE:-?} Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Device | OnePlus 7T Pro (hotdog) |"
+            echo "| Kernel | ${KERNEL_VERSION:-n/a} |"
+            echo "| Kernel SHA | \`${KERNEL_SHA:-n/a}\` |"
+            echo "| BakaSU requested | \`${BAKASU_REF}\` |"
+            echo "| BakaSU actual HEAD | \`${BAKASU_HEAD:-n/a}\` |"
+            echo "| Clang SHA | \`${CLANG_SHA:-unknown}\` |"
+            echo "| Hook | ${HOOK} |"
+            echo "| SUSFS | ${SUSFS_ROW} |"
+            if [ "${SUSFS_ENABLE}" = "true" ]; then
+              echo "| SUSFS core | \`${SUSFS_CORE_REF}\` |"
+              echo "| SUSFS hook patch sha256 | \`${SUSFS_HOOK_PATCH_SHA256:-n/a}\` |"
+              echo "| SUSFS upstream (${SUSFS_UPSTREAM_BRANCH}) | ${SUSFS_UPSTREAM_VERSION:-n/a} @ \`${SUSFS_UPSTREAM_REF}\` |"
+            fi
+            echo "| LOCALVERSION | ${LOCALVERSION:-n/a} |"
+            echo "| Clean build | ${CLEAN_BUILD} |"
+            echo ""
+            echo "Clang cache key: clang-proton-${CLANG_BRANCH}-v1"
+            echo ""
+            echo "ARM32 GCC toolchain was not explicitly installed."
+            echo "Check build.log if compat VDSO or ARM32 toolchain errors occur."
+          } >> "${GITHUB_STEP_SUMMARY}"
