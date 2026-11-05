@@ -1,5 +1,5 @@
 name: OnePlus 7T Pro (hotdog) BakaSU + SUSFS v2.3.0
-# made by ChatGPT Grok Claude
+# made by ChatGPT Grok Claude PerplexityAI
 #
 # 两种模式：
 #   susfs = false  -> Stage A：仅 BakaSU，CONFIG_KSU_MANUAL_HOOK（与原工作流行为一致）
@@ -61,6 +61,8 @@ env:
 
   # 本树专用 4.14 内核钩子补丁（提交在本仓库内）
   SUSFS_HOOK_PATCH: susfs/4.14/50_add_susfs_in_kernel-4.14-sm8150.patch
+  # Stage A 专用：KSU Manual Hook（exec/open/stat/reboot），针对干净的 crDroid 17.0 基线
+  MANUAL_HOOK_PATCH: patch/manual_hook.patch
 
   # SUSFS 核心（v2.3.0 + Linux 4.14 适配），固定到已验证提交
   SUSFS_CORE_REPO: https://github.com/souta-lab/agate-bakasu-susfs.git
@@ -264,17 +266,35 @@ jobs:
       # 6. Integrate SUSFS v2.3.0 (Stage B only)
       # --------------------------------------------------
 
+      - name: Stage A - apply KSU manual hooks
+        if: env.SUSFS_ENABLE != 'true'
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${MANUAL_HOOK_PATCH}" ]; then
+            echo "::error::未找到 ${MANUAL_HOOK_PATCH}"
+            exit 1
+          fi
+
+          if grep -q 'CONFIG_KSU_MANUAL_HOOK' fs/exec.c; then
+            echo "源码树已包含 Manual Hook，跳过"
+          else
+            git apply --check --verbose "${MANUAL_HOOK_PATCH}"
+            git apply --verbose "${MANUAL_HOOK_PATCH}"
+          fi
+
+          # exec 必须同时有声明和调用，否则 su 无法工作
+          test "$(grep -c 'ksu_handle_execveat' fs/exec.c)" -ge 2 || {
+            echo "::error::fs/exec.c 缺少 ksu_handle_execveat 调用"; exit 1; }
+          grep -q ksu_handle_faccessat  fs/open.c
+          grep -q ksu_handle_stat       fs/stat.c
+          grep -q ksu_handle_sys_reboot kernel/reboot.c
+          echo "Manual hooks OK"
+
       - name: Integrate SUSFS - apply 4.14 kernel hooks
         if: env.SUSFS_ENABLE == 'true'
         run: |
           set -euo pipefail
-          cd $GITHUB_WORKSPACE/
-          patch exec.c < exec.c.patch
-          patch open.c < open.c.patch
-          patch reboot.c < reboot.c.patch
-          patch stat.c < stat.c.patch
-          echo The "patcher" has been patched."
-          
 
           if [ ! -f "${SUSFS_HOOK_PATCH}" ]; then
             echo "::error::未找到 ${SUSFS_HOOK_PATCH}"
@@ -538,6 +558,22 @@ jobs:
 
             echo 'CONFIG_OVERLAY_FS=y'
 
+            # WLAN 编进内核：ROM 的 vendor_dlkm/qca_cld3_wlan.ko 是用 ROM 密钥签名、
+            # 按 ROM 内核 vermagic 编译的，MODULE_SIG_FORCE=y + MODVERSIONS=y 下会被拒载
+            echo 'CONFIG_QCA_CLD_WLAN=y'
+
+            # 网络：BBR + FQ（默认拥塞控制保持 cubic，可在用户态切换）
+            echo 'CONFIG_TCP_CONG_ADVANCED=y'
+            echo 'CONFIG_TCP_CONG_CUBIC=y'
+            echo 'CONFIG_TCP_CONG_BBR=y'
+            echo 'CONFIG_TCP_CONG_WESTWOOD=y'
+            echo 'CONFIG_DEFAULT_CUBIC=y'
+            for c in BIC HTCP HSTCP HYBLA VEGAS NV SCALABLE LP VENO YEAH ILLINOIS DCTCP CDG; do
+              echo "# CONFIG_TCP_CONG_${c} is not set"
+            done
+            echo 'CONFIG_NET_SCH_FQ=y'
+            echo 'CONFIG_NET_SCH_FQ_CODEL=y'
+
             echo "CONFIG_LOCALVERSION=\"${LV}\""
           } > out/extra.config
 
@@ -597,8 +633,7 @@ jobs:
           scripts/config --file out/.config --enable CONFIG_IP6_NF_TARGET_HL || true
           scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS || true
           scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS_F_FS || true
-          scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS_F_RNDIS || true
-          scripts/config --file out/.config --enable CONFIG_QCA_CLD_WLAN || true
+          scripts/config --file out/.config --enable CONFIG_USB_CONFIGFS_RNDIS || true
 
           make "${MK_ARGS[@]}" olddefconfig
 
@@ -615,6 +650,16 @@ jobs:
           require CONFIG_KSU
           require CONFIG_OVERLAY_FS
           require CONFIG_KALLSYMS_ALL
+
+          # 硬件 / 网络关键项：缺失直接失败，避免刷入后丢功能
+          for c in QCA_CLD_WLAN ICNSS CNSS_GENL IPA3 RMNET MSM_BT_POWER BT NFC_NQ \
+                   OPLUS_FINGERPRINT OPLUS_FINGERPRINT_GOODIX TOUCHPANEL_OPLUS \
+                   TOUCHPANEL_SAMSUNG TOUCHPANEL_SYNAPTICS SENSORS_SSC \
+                   WIREGUARD TUN TCP_CONG_BBR NET_SCH_FQ USB_CONFIGFS_RNDIS USB_CONFIGFS_NCM; do
+            require "CONFIG_${c}"
+          done
+          echo "----- 仍为模块 (=m) 的选项（ROM 不会加载它们）-----"
+          grep '=m$' out/.config || echo "(none)"
 
           if [ "${SUSFS_ENABLE}" = "true" ]; then
             require CONFIG_THREAD_INFO_IN_TASK
