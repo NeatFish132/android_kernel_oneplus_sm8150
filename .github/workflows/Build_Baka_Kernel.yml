@@ -318,7 +318,7 @@ jobs:
       # 6. Integrate SUSFS v2.3.0 (Stage B only)
       # --------------------------------------------------
 
-      - name: Stage A - apply KSU manual hooks
+      - name: apply KSU manual hooks
         if: env.SUSFS_ENABLE != 'true'
         run: |
           set -euo pipefail
