@@ -1,44 +1,50 @@
 name: OnePlus 7T Pro (hotdog) BakaSU + SUSFS v2.3.0
 # made by ChatGPT Grok Claude PerplexityAI
 #
-# 两种模式：
-#   susfs = false  -> Stage A：仅 BakaSU，CONFIG_KSU_MANUAL_HOOK（与原工作流行为一致）
-#   susfs = true   -> Stage B：BakaSU + SUSFS v2.3.0，CONFIG_KSU_SUSFS（SuSFS Inline Hook）
+# Two modes:
+#   susfs = false  -> Stage A: BakaSU only, CONFIG_KSU_MANUAL_HOOK (consistent with original workflow behavior)
+#   susfs = true   -> Stage B: BakaSU + SUSFS v2.3.0, CONFIG_KSU_SUSFS (SuSFS Inline Hook)
 #
-# SUSFS 集成说明：
-#   - 上游 susfs4ksu 的 gki-android16-6.12 分支是 v2.3.0 的 GKI 6.12 实现，
-#     其内核补丁和 susfs.c 依赖 5.x/6.x 接口（handle_inode_event、bootconfig 等），
-#     无法直接用于 4.14。
-#   - 内核钩子：使用本仓库 susfs/4.14/ 下针对本树（4.14.357）生成的补丁，
-#     由 agate-bakasu-susfs 的 4.14 移植改写而来，并按本树的 ida_alloc API、
-#     BakaSU 钩子签名做了适配。
-#   - 核心文件（fs/susfs.c、include/linux/susfs.h、include/linux/susfs_def.h）：
-#     构建时从 agate-bakasu-susfs 固定提交拉取（v2.3.0 + Linux 4.14 适配，已实机验证），
-#     不提交进本仓库（上游 SUSFS 为 GPL-3.0，见许可证说明）。
-#   - 上游 6.12 分支固定提交仅作对照：校验 SUSFS_VERSION 一致，并输出差异报告。
+# SUSFS Integration Notes:
+#   - Upstream susfs4ksu's gki-android16-6.12 branch is the GKI 6.12 implementation of v2.3.0,
+#     whose kernel patches and susfs.c depend on 5.x/6.x interfaces (handle_inode_event, bootconfig, etc.),
+#     and cannot be directly used for 4.14.
+#   - Kernel hooks: Uses the patch generated for this tree (4.14.357) under susfs/4.14/ in this repository,
+#     ported and rewritten from agate-bakasu-susfs's 4.14 port, adapted according to this tree's ida_alloc API
+#     and BakaSU hook signatures.
+#   - Core files (fs/susfs.c, include/linux/susfs.h, include/linux/susfs_def.h):
+#     Fetched from fixed commit of agate-bakasu-susfs at build time (v2.3.0 + Linux 4.14 port, verified on device),
+#     not committed to this repository (upstream SUSFS is GPL-3.0, see license notes).
+#   - Upstream 6.12 branch fixed commit is for reference only: verifies SUSFS_VERSION consistency and outputs diff report.
 
 on:
   workflow_dispatch:
     inputs:
       bakasu_ref:
-        description: 'BakaSU 完整 40 位 commit SHA'
+        description: 'Full 40-character commit SHA of BakaSU'
         type: string
         required: true
 
       susfs:
-        description: '集成 SUSFS v2.3.0（关闭则为 Stage A：仅 BakaSU Manual Hook）'
+        description: 'Integrate SUSFS v2.3.0 (disable for Stage A: BakaSU Manual Hook only)'
         type: boolean
         required: false
         default: true
 
+      build_baka:
+        description: 'Build Baka-<commit>.apk'
+        type: string
+        required: false
+        default: ''
+
       localversion:
-        description: 'CONFIG_LOCALVERSION 后缀（留空：Stage A 为 -BakaSU，SUSFS 为 -BakaSU-SUSFS）'
+        description: 'CONFIG_LOCALVERSION suffix (leave blank: -BakaSU for Stage A, -BakaSU-SUSFS for SUSFS)'
         type: string
         required: false
         default: ''
 
       clean_build:
-        description: '清除 out/ 与 ccache 后全量编译'
+        description: 'Full clean build after clearing out/ and ccache'
         type: boolean
         required: false
         default: true
@@ -59,16 +65,16 @@ env:
   # ---------------- SUSFS ----------------
   SUSFS_EXPECTED_VERSION: v2.3.0
 
-  # 本树专用 4.14 内核钩子补丁（提交在本仓库内）
+  # Dedicated 4.14 kernel hook patch for this tree (committed in this repository)
   SUSFS_HOOK_PATCH: susfs/4.14/50_add_susfs_in_kernel-4.14-sm8150.patch
-  # Stage A 专用：KSU Manual Hook（exec/open/stat/reboot），针对干净的 crDroid 17.0 基线
+  # Stage A dedicated: KSU Manual Hook (exec/open/stat/reboot), targeted at clean crDroid 17.0 baseline
   MANUAL_HOOK_PATCH: patch/manual_hook.patch
 
-  # SUSFS 核心（v2.3.0 + Linux 4.14 适配），固定到已验证提交
+  # SUSFS core (v2.3.0 + Linux 4.14 port), pinned to verified commit
   SUSFS_CORE_REPO: https://github.com/souta-lab/agate-bakasu-susfs.git
   SUSFS_CORE_REF: a5b81689cce322729342bf51bab6ca5affcebebf
 
-  # 上游 susfs4ksu gki-android16-6.12，仅用于版本校验与差异报告
+  # Upstream susfs4ksu gki-android16-6.12, used for version verification and diff report only
   SUSFS_UPSTREAM_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
   SUSFS_UPSTREAM_BRANCH: gki-android16-6.12
   SUSFS_UPSTREAM_REF: 6b60a305d418148bd311f4fc9bddedc82d99e1fc
@@ -99,19 +105,19 @@ jobs:
           set -euo pipefail
 
           if ! [[ "${BAKASU_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::bakasu_ref 必须是完整的 40 位 commit SHA"
+            echo "::error::bakasu_ref must be a full 40-character commit SHA"
             exit 1
           fi
 
           if [[ -n "${LOCALVERSION_INPUT}" ]] &&
              ! [[ "${LOCALVERSION_INPUT}" =~ ^[-a-zA-Z0-9._+]+$ ]]; then
-            echo "::error::localversion 只允许字母、数字、点、下划线、加号和连字符"
+            echo "::error::localversion only allows letters, numbers, dots, underscores, plus signs, and hyphens"
             exit 1
           fi
 
           for v in SUSFS_CORE_REF SUSFS_UPSTREAM_REF; do
             if ! [[ "${!v}" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::${v} 必须是完整的 40 位 commit SHA"
+              echo "::error::${v} must be a full 40-character commit SHA"
               exit 1
             fi
           done
@@ -145,6 +151,17 @@ jobs:
       # --------------------------------------------------
       # 3. Install dependencies
       # --------------------------------------------------
+
+      - name: Setup Java 21
+        if: inputs.build_baka != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          
+      - name: Setup Android SDK
+        if: inputs.build_baka != ''
+        uses: android-actions/setup-android@v3
 
       - name: Free disk space & install dependencies
         run: |
@@ -272,20 +289,20 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${MANUAL_HOOK_PATCH}" ]; then
-            echo "::error::未找到 ${MANUAL_HOOK_PATCH}"
+            echo "::error::Not found: ${MANUAL_HOOK_PATCH}"
             exit 1
           fi
 
           if grep -q 'CONFIG_KSU_MANUAL_HOOK' fs/exec.c; then
-            echo "源码树已包含 Manual Hook，跳过"
+            echo "Source tree already contains Manual Hook, skipping"
           else
             git apply --check --verbose "${MANUAL_HOOK_PATCH}"
             git apply --verbose "${MANUAL_HOOK_PATCH}"
           fi
 
-          # exec 必须同时有声明和调用，否则 su 无法工作
+          # exec must have both declaration and call, otherwise su will not work
           test "$(grep -c 'ksu_handle_execveat' fs/exec.c)" -ge 2 || {
-            echo "::error::fs/exec.c 缺少 ksu_handle_execveat 调用"; exit 1; }
+            echo "::error::fs/exec.c is missing ksu_handle_execveat call"; exit 1; }
           grep -q ksu_handle_faccessat  fs/open.c
           grep -q ksu_handle_stat       fs/stat.c
           grep -q ksu_handle_sys_reboot kernel/reboot.c
@@ -297,21 +314,21 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${SUSFS_HOOK_PATCH}" ]; then
-            echo "::error::未找到 ${SUSFS_HOOK_PATCH}"
+            echo "::error::Not found: ${SUSFS_HOOK_PATCH}"
             exit 1
           fi
 
           if [ -e fs/susfs.c ] || [ -e include/linux/susfs.h ] ||
              grep -q 'CONFIG_KSU_SUSFS' fs/namespace.c; then
-            echo "::error::源码树中已存在 SUSFS 相关内容，拒绝重复集成"
+            echo "::error::SUSFS related content already exists in source tree, refusing duplicate integration"
             exit 1
           fi
 
-          # 严格应用：不允许 fuzz / offset 之外的偏差
+          # Strict application: no deviations beyond fuzz / offset allowed
           git apply --check --verbose "${SUSFS_HOOK_PATCH}"
           git apply --verbose "${SUSFS_HOOK_PATCH}"
 
-          # 应用后检查：BakaSU SuSFS Inline Hook 必需的 7 个钩子
+          # Post-application check: 7 required hooks for BakaSU SuSFS Inline Hook
           declare -A REQUIRED=(
             [kernel/sys.c]=ksu_handle_setresuid
             [fs/exec.c]=ksu_handle_execveat
@@ -323,14 +340,14 @@ jobs:
           )
           for f in "${!REQUIRED[@]}"; do
             grep -q "${REQUIRED[$f]}" "$f" || {
-              echo "::error::${f} 缺少 ${REQUIRED[$f]}"
+              echo "::error::${f} is missing ${REQUIRED[$f]}"
               exit 1
             }
           done
 
-          # SUSFS 模式下不应残留 Manual Hook 守卫
+          # CONFIG_KSU_MANUAL_HOOK guards should not remain in SUSFS mode
           if grep -ln 'CONFIG_KSU_MANUAL_HOOK' "${!REQUIRED[@]}"; then
-            echo "::error::以上文件仍有 CONFIG_KSU_MANUAL_HOOK 守卫，SUSFS 模式下钩子不会被编译"
+            echo "::error::The above files still have CONFIG_KSU_MANUAL_HOOK guards, hooks will not be compiled in SUSFS mode"
             exit 1
           fi
 
@@ -363,7 +380,7 @@ jobs:
 
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             if [ ! -s "${CORE_DIR}/${f}" ]; then
-              echo "::error::SUSFS core 缺少 ${f}"
+              echo "::error::SUSFS core is missing ${f}"
               exit 1
             fi
             install -m 0644 "${CORE_DIR}/${f}" "${f}"
@@ -372,19 +389,19 @@ jobs:
 
           VER="$(sed -n 's/^#define[[:space:]]\+SUSFS_VERSION[[:space:]]\+"\([^"]*\)".*/\1/p' include/linux/susfs.h)"
           if [ "${VER}" != "${SUSFS_EXPECTED_VERSION}" ]; then
-            echo "::error::SUSFS 核心版本为 ${VER:-unknown}，期望 ${SUSFS_EXPECTED_VERSION}"
+            echo "::error::SUSFS core version is ${VER:-unknown}, expected ${SUSFS_EXPECTED_VERSION}"
             exit 1
           fi
 
-          # 4.14 适配的关键标志：4.14 fsnotify 只有 handle_event（10 参数），
-          # 适配版会为 < 5.1 内核提供 .handle_event 回调
+          # Key flag for 4.14 adaptation: 4.14 fsnotify only has handle_event (10 parameters),
+          # the adapted version provides .handle_event callback for < 5.1 kernels
           if ! grep -q '\.handle_event[[:space:]]*=' fs/susfs.c; then
-            echo "::error::fs/susfs.c 缺少 4.14 fsnotify .handle_event 适配，可能不是 4.14 移植版"
+            echo "::error::fs/susfs.c is missing 4.14 fsnotify .handle_event adaptation, might not be a 4.14 port"
             exit 1
           fi
 
           grep -q 'obj-$(CONFIG_KSU_SUSFS)' fs/Makefile || {
-            echo "::error::fs/Makefile 未加入 susfs.o"
+            echo "::error::fs/Makefile is missing susfs.o"
             exit 1
           }
 
@@ -411,17 +428,17 @@ jobs:
           echo "SUSFS_UPSTREAM_VERSION=${UP_VER}" >> "${GITHUB_ENV}"
 
           if [ "${UP_VER}" != "${SUSFS_CORE_VERSION}" ]; then
-            echo "::warning::上游 ${SUSFS_UPSTREAM_BRANCH} 版本为 ${UP_VER}，本次使用的 4.14 核心为 ${SUSFS_CORE_VERSION}"
+            echo "::warning::Upstream ${SUSFS_UPSTREAM_BRANCH} version is ${UP_VER}, while current 4.14 core version is ${SUSFS_CORE_VERSION}"
           fi
 
-          # 核心文件差异（上游 6.12 -> 本次使用的 4.14 核心），供后续同步上游修复时参考
+          # Core file diff (upstream 6.12 -> current 4.14 core), for reference when syncing upstream fixes later
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             diff -u \
               --label "upstream-6.12/${f}" "${UP}/kernel_patches/${f}" \
               --label "4.14-core/${f}" "${f}" || true
           done > out/susfs-report/core-upstream-vs-414.diff
 
-          # 上游自上次核对以来是否有新提交（仅提示）
+          # Check if upstream has new commits since last check (notification only)
           LATEST="$(git ls-remote "${SUSFS_UPSTREAM_REPO}" "refs/heads/${SUSFS_UPSTREAM_BRANCH}" | cut -f1 || true)"
           {
             echo "upstream_branch=${SUSFS_UPSTREAM_BRANCH}"
@@ -435,7 +452,7 @@ jobs:
           cat out/susfs-report/versions.txt
 
           if [ -n "${LATEST}" ] && [ "${LATEST}" != "${SUSFS_UPSTREAM_REF}" ]; then
-            echo "::notice::上游 ${SUSFS_UPSTREAM_BRANCH} 已有新提交 ${LATEST}，如需同步请人工评估后移植到 4.14"
+            echo "::notice::Upstream ${SUSFS_UPSTREAM_BRANCH} has new commit ${LATEST}, please manually evaluate and port to 4.14 if syncing is needed"
           fi
 
           echo "Delta lines: $(grep -c '^[-+][^-+]' out/susfs-report/core-upstream-vs-414.diff || true)"
@@ -462,19 +479,19 @@ jobs:
           fi
 
           if [ ! -f /tmp/bakasu/kernel/setup.sh ]; then
-            echo "::error::BakaSU 仓库中不存在 kernel/setup.sh"
+            echo "::error::kernel/setup.sh does not exist in BakaSU repository"
             exit 1
           fi
 
           if [ "${SUSFS_ENABLE}" = "true" ]; then
-            # BakaSU 需要提供 SuSFS Inline Hook 选项，并且不能带有
-            # 旧版 susfs_compat.mk 中“please wait susfs update”的硬拦截
+            # BakaSU must provide SuSFS Inline Hook option, and must not contain
+            # hard block "please wait susfs update" from older susfs_compat.mk
             if ! grep -q '^config KSU_SUSFS$' /tmp/bakasu/kernel/Kconfig; then
-              echo "::error::该 BakaSU 提交不支持 CONFIG_KSU_SUSFS"
+              echo "::error::This BakaSU commit does not support CONFIG_KSU_SUSFS"
               exit 1
             fi
             if grep -qs 'wait susfs update' /tmp/bakasu/kernel/tools/susfs_compat.mk; then
-              echo "::error::该 BakaSU 提交的 susfs_compat.mk 会无条件拒绝 SUSFS，请换用更新的 BakaSU 提交"
+              echo "::error::susfs_compat.mk of this BakaSU commit unconditionally rejects SUSFS, please use a newer BakaSU commit"
               exit 1
             fi
           fi
@@ -484,14 +501,14 @@ jobs:
           bash /tmp/bakasu/kernel/setup.sh "${BAKASU_REF}"
 
           if [ ! -d KernelSU ] || [ ! -d KernelSU/.git ]; then
-            echo "::error::setup 后未找到带 .git 的 KernelSU 目录"
+            echo "::error::KernelSU directory with .git not found after setup"
             exit 1
           fi
 
           ACTUAL="$(git -C KernelSU rev-parse HEAD)"
 
           if ! EXPECTED="$(git -C KernelSU rev-parse --verify "${BAKASU_REF}^{commit}" 2>/dev/null)"; then
-            echo "::error::无法在 KernelSU 仓库解析指定 commit"
+            echo "::error::Failed to resolve specified commit in KernelSU repository"
             echo "Requested: ${BAKASU_REF}"
             echo "Actual: ${ACTUAL}"
             exit 1
@@ -506,6 +523,43 @@ jobs:
 
           echo "BakaSU HEAD=${ACTUAL}"
           echo "BAKASU_HEAD=${ACTUAL}" >> "${GITHUB_ENV}"
+
+      - name: Build BakaSU Manager
+        if: inputs.build_baka != ''
+        env:
+          BUILD_BAKA: ${{ inputs.build_baka }}
+        run: |
+          set -euo pipefail
+
+          if [ "${BUILD_BAKA}" != "${BAKASU_REF}" ]; then
+            echo "::error::build_baka (${BUILD_BAKA}) must equal bakasu_ref (${BAKASU_REF})"
+            exit 1
+          fi
+
+          echo "Building BakaSU Manager at ${BAKASU_REF}..."
+
+          rm -rf /tmp/bakasu-manager
+          git clone "${BAKASU_REPO}" /tmp/bakasu-manager
+          git -C /tmp/bakasu-manager checkout --detach "${BAKASU_REF}"
+
+          cd /tmp/bakasu-manager/manager
+
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon -Pcommit="${BAKASU_REF}"
+
+          mkdir -p "${GITHUB_WORKSPACE}/manager-apks"
+          find app/build/outputs/apk/release -name "*.apk" -exec cp {} "${GITHUB_WORKSPACE}/manager-apks/" \;
+
+          ls -lh "${GITHUB_WORKSPACE}/manager-apks/"
+
+      - name: Upload Manager APK
+        if: inputs.build_baka != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: BakaSU-Manager-${{ env.BAKASU_HEAD }}
+          path: manager-apks/*.apk
+          retention-days: 30
+          if-no-files-found: error
 
       # --------------------------------------------------
       # 8. Generate config fragment
@@ -538,7 +592,7 @@ jobs:
             echo 'CONFIG_KALLSYMS_ALL=y'
 
             if [ "${SUSFS_ENABLE}" = "true" ]; then
-              # Hook 方式三选一：SuSFS Inline Hook
+              # Hook selection (choose one of three): SuSFS Inline Hook
               echo '# CONFIG_KSU_MANUAL_HOOK is not set'
               echo '# CONFIG_KSU_TRACEPOINT_HOOK is not set'
               echo 'CONFIG_KSU_SUSFS=y'
@@ -558,11 +612,11 @@ jobs:
 
             echo 'CONFIG_OVERLAY_FS=y'
 
-            # WLAN 编进内核：ROM 的 vendor_dlkm/qca_cld3_wlan.ko 是用 ROM 密钥签名、
-            # 按 ROM 内核 vermagic 编译的，MODULE_SIG_FORCE=y + MODVERSIONS=y 下会被拒载
+            # Compile WLAN into kernel: ROM's vendor_dlkm/qca_cld3_wlan.ko is signed with ROM keys
+            # and compiled with ROM kernel vermagic; it will be rejected under MODULE_SIG_FORCE=y + MODVERSIONS=y
             echo 'CONFIG_QCA_CLD_WLAN=y'
 
-            # 网络：BBR + FQ（默认拥塞控制保持 cubic，可在用户态切换）
+            # Network: BBR + FQ (default congestion control remains cubic, switchable in user space)
             echo 'CONFIG_TCP_CONG_ADVANCED=y'
             echo 'CONFIG_TCP_CONG_CUBIC=y'
             echo 'CONFIG_TCP_CONG_BBR=y'
@@ -607,7 +661,7 @@ jobs:
           if [ -f "${OPLUS_FRAGMENT}" ]; then
             FRAGS+=("${OPLUS_FRAGMENT}")
           else
-            echo "::warning::${OPLUS_FRAGMENT} 不存在，跳过"
+            echo "::warning::${OPLUS_FRAGMENT} does not exist, skipping"
           fi
 
           FRAGS+=(out/extra.config)
@@ -622,7 +676,7 @@ jobs:
             out/.config \
             "${FRAGS[@]}"
 
-          # 一些日常可能用到的选项（保守添加）
+          # Some options that might be useful daily (conservatively added)
           scripts/config --file out/.config --enable CONFIG_EXFAT_FS || true
           scripts/config --file out/.config --enable CONFIG_NTFS_FS || true
           scripts/config --file out/.config --enable CONFIG_F2FS_FS || true
@@ -641,7 +695,7 @@ jobs:
 
           require() {
             grep -q "^$1=y" out/.config || {
-              echo "::error::$1 未生效"
+              echo "::error::$1 is not active"
               grep -E '^(# )?CONFIG_KSU' out/.config || true
               exit 1
             }
@@ -651,14 +705,14 @@ jobs:
           require CONFIG_OVERLAY_FS
           require CONFIG_KALLSYMS_ALL
 
-          # 硬件 / 网络关键项：缺失直接失败，避免刷入后丢功能
+          # Hardware / network critical items: fail immediately if missing to prevent losing functionality after flashing
           for c in QCA_CLD_WLAN ICNSS CNSS_GENL IPA3 RMNET MSM_BT_POWER BT NFC_NQ \
                    OPLUS_FINGERPRINT OPLUS_FINGERPRINT_GOODIX TOUCHPANEL_OPLUS \
                    TOUCHPANEL_SAMSUNG TOUCHPANEL_SYNAPTICS SENSORS_SSC \
                    WIREGUARD TUN TCP_CONG_BBR NET_SCH_FQ USB_CONFIGFS_RNDIS USB_CONFIGFS_NCM; do
             require "CONFIG_${c}"
           done
-          echo "----- 仍为模块 (=m) 的选项（ROM 不会加载它们）-----"
+          echo "----- Options still as modules (=m) (ROM will not load them) -----"
           grep '=m$' out/.config || echo "(none)"
 
           if [ "${SUSFS_ENABLE}" = "true" ]; then
@@ -671,7 +725,7 @@ jobs:
             done
 
             if grep -qE '^CONFIG_KSU_(MANUAL_HOOK|TRACEPOINT_HOOK)=y' out/.config; then
-              echo "::error::SUSFS 模式不能与 MANUAL_HOOK / TRACEPOINT_HOOK 共存"
+              echo "::error::SUSFS mode cannot coexist with MANUAL_HOOK / TRACEPOINT_HOOK"
               grep -E '^CONFIG_KSU_' out/.config || true
               exit 1
             fi
@@ -679,7 +733,7 @@ jobs:
             require CONFIG_KSU_MANUAL_HOOK
 
             if grep -qE '^CONFIG_KSU_(TRACEPOINT_HOOK|SUSFS)=y' out/.config; then
-              echo "::error::Stage A 不应启用 TRACEPOINT 或 SUSFS Hook"
+              echo "::error::Stage A should not enable TRACEPOINT or SUSFS Hook"
               grep -E '^CONFIG_KSU_' out/.config || true
               exit 1
             fi
@@ -735,30 +789,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # BakaSU 编译期钩子检查（inline_hook_check.mk）必须全部 found
+          # BakaSU compile-time hook checks (inline_hook_check.mk) must all be found
           for h in ksu_handle_setresuid ksu_handle_execveat ksu_handle_faccessat \
                    ksu_handle_sys_read ksu_handle_stat ksu_handle_sys_reboot \
                    ksu_handle_input_handle_event; do
             grep -q "BakaSU/susfs_inline: ${h} found" out/build.log || {
-              echo "::error::BakaSU 钩子检查未通过：${h}"
+              echo "::error::BakaSU hook check failed: ${h}"
               exit 1
             }
           done
 
           grep -q "SUSFS_VERSION: ${SUSFS_EXPECTED_VERSION}" out/build.log || {
-            echo "::error::BakaSU 未识别到 SUSFS ${SUSFS_EXPECTED_VERSION}"
+            echo "::error::BakaSU failed to recognize SUSFS ${SUSFS_EXPECTED_VERSION}"
             exit 1
           }
 
           test -f out/fs/susfs.o || {
-            echo "::error::out/fs/susfs.o 不存在，SUSFS 未被编译"
+            echo "::error::out/fs/susfs.o does not exist, SUSFS was not compiled"
             exit 1
           }
 
           if strings out/vmlinux | grep -q "susfs is initialized! version: ${SUSFS_EXPECTED_VERSION}"; then
             echo "vmlinux contains: susfs is initialized! version: ${SUSFS_EXPECTED_VERSION}"
           else
-            echo "::error::vmlinux 中未找到 SUSFS ${SUSFS_EXPECTED_VERSION} 初始化字符串"
+            echo "::error::SUSFS ${SUSFS_EXPECTED_VERSION} initialization string not found in vmlinux"
             exit 1
           fi
 
@@ -789,7 +843,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${KERNEL_VERSION:-}" ]; then
-            echo "::error::KERNEL_VERSION 未设置"
+            echo "::error::KERNEL_VERSION is not set"
             exit 1
           fi
 
@@ -820,7 +874,7 @@ jobs:
           elif [ -f ../out/arch/arm64/boot/Image.gz ]; then
             cp ../out/arch/arm64/boot/Image.gz .
           else
-            echo "::error::未找到 Image.gz-dtb 或 Image.gz"
+            echo "::error::Image.gz-dtb or Image.gz not found"
             exit 1
           fi
 
