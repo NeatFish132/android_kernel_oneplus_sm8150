@@ -1,50 +1,50 @@
 name: OnePlus 7T Pro (hotdog) BakaSU + SUSFS v2.3.0
-# made by ChatGPT Grok Claude PerplexityAI
+# Created by AI, with a little bit of help from me.
 #
 # Two modes:
 #   susfs = false  -> Stage A: BakaSU only, CONFIG_KSU_MANUAL_HOOK (consistent with original workflow behavior)
 #   susfs = true   -> Stage B: BakaSU + SUSFS v2.3.0, CONFIG_KSU_SUSFS (SuSFS Inline Hook)
 #
-# SUSFS Integration Notes:
-#   - Upstream susfs4ksu's gki-android16-6.12 branch is the GKI 6.12 implementation of v2.3.0,
+# SUSFS integration notes:
+#   - The upstream susfs4ksu gki-android16-6.12 branch is the GKI 6.12 implementation of v2.3.0,
 #     whose kernel patches and susfs.c depend on 5.x/6.x interfaces (handle_inode_event, bootconfig, etc.),
-#     and cannot be directly used for 4.14.
-#   - Kernel hooks: Uses the patch generated for this tree (4.14.357) under susfs/4.14/ in this repository,
-#     ported and rewritten from agate-bakasu-susfs's 4.14 port, adapted according to this tree's ida_alloc API
+#     making it incompatible directly with 4.14.
+#   - Kernel hooks: Use the patch generated for this tree (4.14.357) under susfs/4.14/ in this repo,
+#     rewritten from the 4.14 port of agate-bakasu-susfs, and adapted according to this tree's ida_alloc API
 #     and BakaSU hook signatures.
 #   - Core files (fs/susfs.c, include/linux/susfs.h, include/linux/susfs_def.h):
-#     Fetched from fixed commit of agate-bakasu-susfs at build time (v2.3.0 + Linux 4.14 port, verified on device),
-#     not committed to this repository (upstream SUSFS is GPL-3.0, see license notes).
-#   - Upstream 6.12 branch fixed commit is for reference only: verifies SUSFS_VERSION consistency and outputs diff report.
+#     Pulled from pinned commit of agate-bakasu-susfs at build time (v2.3.0 + Linux 4.14 port, verified on device),
+#     not committed to this repo (upstream SUSFS is GPL-3.0, see license notes).
+#   - Upstream 6.12 branch pinned commit is for reference only: verify SUSFS_VERSION consistency and output diff report.
 
 on:
   workflow_dispatch:
     inputs:
       bakasu_ref:
-        description: 'Full 40-character commit SHA of BakaSU'
+        description: 'Full 40-character BakaSU commit SHA'
         type: string
         required: true
 
       susfs:
-        description: 'Integrate SUSFS v2.3.0 (disable for Stage A: BakaSU Manual Hook only)'
+        description: 'Integrate SUSFS v2.3.0 (disabled = Stage A: BakaSU Manual Hook only)'
         type: boolean
         required: false
         default: true
 
-      build_baka:
-        description: 'Build Baka-<commit>.apk'
-        type: string
+      build_bakasu:
+        description: 'Enabled by default. To avoid version drift between Manager and kernel BakaSU, forces bakasu_ref when enabled; uncheck to skip APK build.'
+        type: boolean
         required: false
-        default: ''
+        default: true
 
       localversion:
-        description: 'CONFIG_LOCALVERSION suffix (leave blank: -BakaSU for Stage A, -BakaSU-SUSFS for SUSFS)'
+        description: 'CONFIG_LOCALVERSION suffix (leave empty: -BakaSU for Stage A, -BakaSU-SUSFS for SUSFS)'
         type: string
         required: false
         default: ''
 
       clean_build:
-        description: 'Full clean build after clearing out/ and ccache'
+        description: 'Clear out/ and skip ccache restoration, perform a full build'
         type: boolean
         required: false
         default: true
@@ -65,12 +65,12 @@ env:
   # ---------------- SUSFS ----------------
   SUSFS_EXPECTED_VERSION: v2.3.0
 
-  # Dedicated 4.14 kernel hook patch for this tree (committed in this repository)
+  # Tree-specific 4.14 kernel hook patch (committed within this repo)
   SUSFS_HOOK_PATCH: susfs/4.14/50_add_susfs_in_kernel-4.14-sm8150.patch
-  # Stage A dedicated: KSU Manual Hook (exec/open/stat/reboot), targeted at clean crDroid 17.0 baseline
+  # Stage A specific: KSU Manual Hook (exec/open/stat/reboot), targeted at a clean crDroid 17.0 baseline
   MANUAL_HOOK_PATCH: patch/manual_hook.patch
 
-  # SUSFS core (v2.3.0 + Linux 4.14 port), pinned to verified commit
+  # SUSFS core (v2.3.0 + Linux 4.14 port), pinned to a verified commit
   SUSFS_CORE_REPO: https://github.com/souta-lab/agate-bakasu-susfs.git
   SUSFS_CORE_REF: a5b81689cce322729342bf51bab6ca5affcebebf
 
@@ -108,6 +108,8 @@ jobs:
             echo "::error::bakasu_ref must be a full 40-character commit SHA"
             exit 1
           fi
+          BAKASU_REF="$(printf '%s' "${BAKASU_REF}" | tr '[:upper:]' '[:lower:]')"
+          echo "BAKASU_REF=${BAKASU_REF}" >> "${GITHUB_ENV}"
 
           if [[ -n "${LOCALVERSION_INPUT}" ]] &&
              ! [[ "${LOCALVERSION_INPUT}" =~ ^[-a-zA-Z0-9._+]+$ ]]; then
@@ -130,6 +132,18 @@ jobs:
             echo "Mode: Stage A (BakaSU only)"
           fi
 
+      - name: Explain Manager APK build
+        if: inputs.build_bakasu == true
+        run: |
+          echo "::notice title=BakaSU Manager APK::Manager APK will be built from the exact BakaSU commit used by the kernel: ${BAKASU_REF}. This avoids kernel/manager version drift."
+          {
+            echo "### BakaSU Manager APK"
+            echo ""
+            echo "Enabled: Manager APK will use the exact same BakaSU commit as the kernel: \`${BAKASU_REF}\`."
+            echo ""
+            echo "Disable the build_bakasu checkbox to skip Java/Android SDK setup and APK compilation."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       # --------------------------------------------------
       # 2. Checkout kernel source
       # --------------------------------------------------
@@ -151,17 +165,6 @@ jobs:
       # --------------------------------------------------
       # 3. Install dependencies
       # --------------------------------------------------
-
-      - name: Setup Java 21
-        if: inputs.build_baka != ''
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-          
-      - name: Setup Android SDK
-        if: inputs.build_baka != ''
-        uses: android-actions/setup-android@v3
 
       - name: Free disk space & install dependencies
         run: |
@@ -200,31 +203,59 @@ jobs:
             curl \
             ca-certificates
 
+      # Android SDK is installed after disk cleanup so it is not deleted by the cleanup step.
+      - name: Setup Java 21
+        if: inputs.build_bakasu == true
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        if: inputs.build_bakasu == true
+        uses: android-actions/setup-android@v3
+
       # --------------------------------------------------
       # 4. Cache Clang
       # --------------------------------------------------
+
+      - name: Resolve Clang commit
+        id: clang-ref
+        run: |
+          set -euo pipefail
+
+          CLANG_EXPECTED_SHA="$(git ls-remote "${CLANG_REPO}" "refs/heads/${CLANG_BRANCH}" | awk 'NR == 1 {print $1}')"
+          if ! [[ "${CLANG_EXPECTED_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve commit SHA for Proton Clang ${CLANG_BRANCH}"
+            exit 1
+          fi
+
+          echo "sha=${CLANG_EXPECTED_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved Proton Clang ${CLANG_BRANCH}: ${CLANG_EXPECTED_SHA}"
 
       - name: Cache Clang
         id: cache-clang
         uses: actions/cache@v4
         with:
           path: toolchain/clang
-          key: clang-proton-${{ env.CLANG_BRANCH }}-v1
+          key: clang-proton-${{ steps.clang-ref.outputs.sha }}-v1
 
       - name: Download Clang
         if: steps.cache-clang.outputs.cache-hit != 'true'
+        env:
+          CLANG_EXPECTED_SHA: ${{ steps.clang-ref.outputs.sha }}
         run: |
           set -euo pipefail
 
-          mkdir -p toolchain
-
-          git clone \
-            --depth=1 \
-            -b "${CLANG_BRANCH}" \
-            "${CLANG_REPO}" \
-            toolchain/clang
+          mkdir -p toolchain/clang
+          git -C toolchain/clang init
+          git -C toolchain/clang remote add origin "${CLANG_REPO}"
+          git -C toolchain/clang fetch --depth=1 origin "${CLANG_EXPECTED_SHA}"
+          git -C toolchain/clang checkout --detach FETCH_HEAD
 
       - name: Setup PATH & record Clang
+        env:
+          CLANG_EXPECTED_SHA: ${{ steps.clang-ref.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -233,11 +264,17 @@ jobs:
             exit 1
           fi
 
+          CLANG_SHA="$(git -C toolchain/clang rev-parse HEAD)"
+          if [ "${CLANG_SHA}" != "${CLANG_EXPECTED_SHA}" ]; then
+            echo "::error::Cached/downloaded Clang commit mismatch"
+            echo "Expected: ${CLANG_EXPECTED_SHA}"
+            echo "Actual:   ${CLANG_SHA}"
+            exit 1
+          fi
+
           echo "${GITHUB_WORKSPACE}/toolchain/clang/bin" >> "${GITHUB_PATH}"
 
           CLANG_VERSION="$(toolchain/clang/bin/clang --version | head -n1)"
-          CLANG_SHA="$(git -C toolchain/clang rev-parse HEAD)"
-
           echo "CLANG_SHA=${CLANG_SHA}" >> "${GITHUB_ENV}"
 
           echo "Clang version: ${CLANG_VERSION}"
@@ -248,10 +285,11 @@ jobs:
       # --------------------------------------------------
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        if: inputs.clean_build != true
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-stage-${{ inputs.susfs && 'b' || 'a' }}-${{ env.DEVICE_CODENAME }}-${{ github.sha }}
+          key: ccache-stage-${{ inputs.susfs && 'b' || 'a' }}-${{ env.DEVICE_CODENAME }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ccache-stage-${{ inputs.susfs && 'b' || 'a' }}-${{ env.DEVICE_CODENAME }}-
 
@@ -270,11 +308,8 @@ jobs:
           mkdir -p "${CCACHE_DIR}"
 
           if [ "${CLEAN_BUILD}" = "true" ]; then
-            echo "Clean build enabled: removing out/ and ccache"
-
-            rm -rf "${CCACHE_DIR}" out
-
-            mkdir -p "${CCACHE_DIR}"
+            echo "Clean build enabled: removing out/ (ccache starts empty because restore was skipped)"
+            rm -rf out
           fi
 
           ccache -z
@@ -289,7 +324,7 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${MANUAL_HOOK_PATCH}" ]; then
-            echo "::error::Not found: ${MANUAL_HOOK_PATCH}"
+            echo "::error::${MANUAL_HOOK_PATCH} not found"
             exit 1
           fi
 
@@ -314,21 +349,21 @@ jobs:
           set -euo pipefail
 
           if [ ! -f "${SUSFS_HOOK_PATCH}" ]; then
-            echo "::error::Not found: ${SUSFS_HOOK_PATCH}"
+            echo "::error::${SUSFS_HOOK_PATCH} not found"
             exit 1
           fi
 
           if [ -e fs/susfs.c ] || [ -e include/linux/susfs.h ] ||
              grep -q 'CONFIG_KSU_SUSFS' fs/namespace.c; then
-            echo "::error::SUSFS related content already exists in source tree, refusing duplicate integration"
+            echo "::error::SUSFS-related content already exists in the source tree, refusing duplicate integration"
             exit 1
           fi
 
-          # Strict application: no deviations beyond fuzz / offset allowed
+          # Strict application: no deviations other than fuzz / offset are allowed
           git apply --check --verbose "${SUSFS_HOOK_PATCH}"
           git apply --verbose "${SUSFS_HOOK_PATCH}"
 
-          # Post-application check: 7 required hooks for BakaSU SuSFS Inline Hook
+          # Post-application check: The 7 hooks required for BakaSU SuSFS Inline Hook
           declare -A REQUIRED=(
             [kernel/sys.c]=ksu_handle_setresuid
             [fs/exec.c]=ksu_handle_execveat
@@ -345,7 +380,7 @@ jobs:
             }
           done
 
-          # CONFIG_KSU_MANUAL_HOOK guards should not remain in SUSFS mode
+          # No Manual Hook guards should remain in SUSFS mode
           if grep -ln 'CONFIG_KSU_MANUAL_HOOK' "${!REQUIRED[@]}"; then
             echo "::error::The above files still have CONFIG_KSU_MANUAL_HOOK guards, hooks will not be compiled in SUSFS mode"
             exit 1
@@ -393,15 +428,15 @@ jobs:
             exit 1
           fi
 
-          # Key flag for 4.14 adaptation: 4.14 fsnotify only has handle_event (10 parameters),
-          # the adapted version provides .handle_event callback for < 5.1 kernels
+          # Key flag for 4.14 port: 4.14 fsnotify only has handle_event (10 parameters),
+          # the ported version provides the .handle_event callback for < 5.1 kernels
           if ! grep -q '\.handle_event[[:space:]]*=' fs/susfs.c; then
-            echo "::error::fs/susfs.c is missing 4.14 fsnotify .handle_event adaptation, might not be a 4.14 port"
+            echo "::error::fs/susfs.c is missing 4.14 fsnotify .handle_event adaptation, may not be a 4.14 port"
             exit 1
           fi
 
           grep -q 'obj-$(CONFIG_KSU_SUSFS)' fs/Makefile || {
-            echo "::error::fs/Makefile is missing susfs.o"
+            echo "::error::fs/Makefile does not include susfs.o"
             exit 1
           }
 
@@ -428,17 +463,17 @@ jobs:
           echo "SUSFS_UPSTREAM_VERSION=${UP_VER}" >> "${GITHUB_ENV}"
 
           if [ "${UP_VER}" != "${SUSFS_CORE_VERSION}" ]; then
-            echo "::warning::Upstream ${SUSFS_UPSTREAM_BRANCH} version is ${UP_VER}, while current 4.14 core version is ${SUSFS_CORE_VERSION}"
+            echo "::warning::Upstream ${SUSFS_UPSTREAM_BRANCH} version is ${UP_VER}, while the 4.14 core used here is ${SUSFS_CORE_VERSION}"
           fi
 
-          # Core file diff (upstream 6.12 -> current 4.14 core), for reference when syncing upstream fixes later
+          # Core file differences (upstream 6.12 -> 4.14 core used here), for reference when syncing upstream fixes later
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             diff -u \
               --label "upstream-6.12/${f}" "${UP}/kernel_patches/${f}" \
               --label "4.14-core/${f}" "${f}" || true
           done > out/susfs-report/core-upstream-vs-414.diff
 
-          # Check if upstream has new commits since last check (notification only)
+          # Check if there are new commits upstream since last check (notification only)
           LATEST="$(git ls-remote "${SUSFS_UPSTREAM_REPO}" "refs/heads/${SUSFS_UPSTREAM_BRANCH}" | cut -f1 || true)"
           {
             echo "upstream_branch=${SUSFS_UPSTREAM_BRANCH}"
@@ -452,7 +487,7 @@ jobs:
           cat out/susfs-report/versions.txt
 
           if [ -n "${LATEST}" ] && [ "${LATEST}" != "${SUSFS_UPSTREAM_REF}" ]; then
-            echo "::notice::Upstream ${SUSFS_UPSTREAM_BRANCH} has new commit ${LATEST}, please manually evaluate and port to 4.14 if syncing is needed"
+            echo "::notice::Upstream ${SUSFS_UPSTREAM_BRANCH} has new commit ${LATEST}, please evaluate and port to 4.14 manually if needed"
           fi
 
           echo "Delta lines: $(grep -c '^[-+][^-+]' out/susfs-report/core-upstream-vs-414.diff || true)"
@@ -479,19 +514,19 @@ jobs:
           fi
 
           if [ ! -f /tmp/bakasu/kernel/setup.sh ]; then
-            echo "::error::kernel/setup.sh does not exist in BakaSU repository"
+            echo "::error::kernel/setup.sh does not exist in the BakaSU repository"
             exit 1
           fi
 
           if [ "${SUSFS_ENABLE}" = "true" ]; then
-            # BakaSU must provide SuSFS Inline Hook option, and must not contain
-            # hard block "please wait susfs update" from older susfs_compat.mk
+            # BakaSU must provide the SuSFS Inline Hook option and must not contain
+            # the hard block "please wait susfs update" from older susfs_compat.mk
             if ! grep -q '^config KSU_SUSFS$' /tmp/bakasu/kernel/Kconfig; then
               echo "::error::This BakaSU commit does not support CONFIG_KSU_SUSFS"
               exit 1
             fi
             if grep -qs 'wait susfs update' /tmp/bakasu/kernel/tools/susfs_compat.mk; then
-              echo "::error::susfs_compat.mk of this BakaSU commit unconditionally rejects SUSFS, please use a newer BakaSU commit"
+              echo "::error::This BakaSU commit's susfs_compat.mk unconditionally rejects SUSFS, please switch to a newer BakaSU commit"
               exit 1
             fi
           fi
@@ -525,35 +560,44 @@ jobs:
           echo "BAKASU_HEAD=${ACTUAL}" >> "${GITHUB_ENV}"
 
       - name: Build BakaSU Manager
-        if: inputs.build_baka != ''
-        env:
-          BUILD_BAKA: ${{ inputs.build_baka }}
+        if: inputs.build_bakasu == true
         run: |
           set -euo pipefail
 
-          if [ "${BUILD_BAKA}" != "${BAKASU_REF}" ]; then
-            echo "::error::build_baka (${BUILD_BAKA}) must equal bakasu_ref (${BAKASU_REF})"
+          echo "Building BakaSU Manager from the exact kernel BakaSU commit: ${BAKASU_REF}"
+
+          # Reuse the exact checkout already used by the kernel integration step.
+          MANAGER_SHA="$(git -C /tmp/bakasu rev-parse HEAD)"
+          if [ "${MANAGER_SHA}" != "${BAKASU_REF}" ] || [ "${MANAGER_SHA}" != "${BAKASU_HEAD}" ]; then
+            echo "::error::Manager source does not match the integrated kernel BakaSU commit"
+            echo "Requested: ${BAKASU_REF}"
+            echo "Integrated: ${BAKASU_HEAD}"
+            echo "Manager: ${MANAGER_SHA}"
             exit 1
           fi
 
-          echo "Building BakaSU Manager at ${BAKASU_REF}..."
+          if [ ! -f /tmp/bakasu/manager/gradlew ]; then
+            echo "::error::BakaSU commit ${BAKASU_REF} does not contain manager/gradlew"
+            exit 1
+          fi
 
-          rm -rf /tmp/bakasu-manager
-          git clone "${BAKASU_REPO}" /tmp/bakasu-manager
-          git -C /tmp/bakasu-manager checkout --detach "${BAKASU_REF}"
-
-          cd /tmp/bakasu-manager/manager
-
+          cd /tmp/bakasu/manager
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon -Pcommit="${BAKASU_REF}"
 
           mkdir -p "${GITHUB_WORKSPACE}/manager-apks"
-          find app/build/outputs/apk/release -name "*.apk" -exec cp {} "${GITHUB_WORKSPACE}/manager-apks/" \;
+          find app/build/outputs/apk/release -type f -name "*.apk" -exec cp {} "${GITHUB_WORKSPACE}/manager-apks/" \;
 
+          if ! compgen -G "${GITHUB_WORKSPACE}/manager-apks/*.apk" > /dev/null; then
+            echo "::error::Manager build completed but no release APK was produced"
+            exit 1
+          fi
+
+          echo "BAKASU_MANAGER_SHA=${MANAGER_SHA}" >> "${GITHUB_ENV}"
           ls -lh "${GITHUB_WORKSPACE}/manager-apks/"
 
       - name: Upload Manager APK
-        if: inputs.build_baka != ''
+        if: success() && inputs.build_bakasu == true
         uses: actions/upload-artifact@v4
         with:
           name: BakaSU-Manager-${{ env.BAKASU_HEAD }}
@@ -592,7 +636,7 @@ jobs:
             echo 'CONFIG_KALLSYMS_ALL=y'
 
             if [ "${SUSFS_ENABLE}" = "true" ]; then
-              # Hook selection (choose one of three): SuSFS Inline Hook
+              # Hook selection (one of three): SuSFS Inline Hook
               echo '# CONFIG_KSU_MANUAL_HOOK is not set'
               echo '# CONFIG_KSU_TRACEPOINT_HOOK is not set'
               echo 'CONFIG_KSU_SUSFS=y'
@@ -612,11 +656,11 @@ jobs:
 
             echo 'CONFIG_OVERLAY_FS=y'
 
-            # Compile WLAN into kernel: ROM's vendor_dlkm/qca_cld3_wlan.ko is signed with ROM keys
-            # and compiled with ROM kernel vermagic; it will be rejected under MODULE_SIG_FORCE=y + MODVERSIONS=y
+            # WLAN compiled into kernel: ROM's vendor_dlkm/qca_cld3_wlan.ko is signed with ROM keys,
+            # compiled with ROM kernel vermagic, and will be rejected under MODULE_SIG_FORCE=y + MODVERSIONS=y
             echo 'CONFIG_QCA_CLD_WLAN=y'
 
-            # Network: BBR + FQ (default congestion control remains cubic, switchable in user space)
+            # Network: BBR + FQ (default congestion control remains cubic, switchable in userspace)
             echo 'CONFIG_TCP_CONG_ADVANCED=y'
             echo 'CONFIG_TCP_CONG_CUBIC=y'
             echo 'CONFIG_TCP_CONG_BBR=y'
@@ -676,7 +720,7 @@ jobs:
             out/.config \
             "${FRAGS[@]}"
 
-          # Some options that might be useful daily (conservatively added)
+          # Options that might be useful for daily use (conservatively added)
           scripts/config --file out/.config --enable CONFIG_EXFAT_FS || true
           scripts/config --file out/.config --enable CONFIG_NTFS_FS || true
           scripts/config --file out/.config --enable CONFIG_F2FS_FS || true
@@ -695,7 +739,7 @@ jobs:
 
           require() {
             grep -q "^$1=y" out/.config || {
-              echo "::error::$1 is not active"
+              echo "::error::$1 is not enabled"
               grep -E '^(# )?CONFIG_KSU' out/.config || true
               exit 1
             }
@@ -705,7 +749,7 @@ jobs:
           require CONFIG_OVERLAY_FS
           require CONFIG_KALLSYMS_ALL
 
-          # Hardware / network critical items: fail immediately if missing to prevent losing functionality after flashing
+          # Critical hardware/network items: fail directly if missing to prevent losing functionality after flashing
           for c in QCA_CLD_WLAN ICNSS CNSS_GENL IPA3 RMNET MSM_BT_POWER BT NFC_NQ \
                    OPLUS_FINGERPRINT OPLUS_FINGERPRINT_GOODIX TOUCHPANEL_OPLUS \
                    TOUCHPANEL_SAMSUNG TOUCHPANEL_SYNAPTICS SENSORS_SSC \
@@ -725,7 +769,7 @@ jobs:
             done
 
             if grep -qE '^CONFIG_KSU_(MANUAL_HOOK|TRACEPOINT_HOOK)=y' out/.config; then
-              echo "::error::SUSFS mode cannot coexist with MANUAL_HOOK / TRACEPOINT_HOOK"
+              echo "::error::SUSFS mode cannot coexist with MANUAL_HOOK or TRACEPOINT_HOOK"
               grep -E '^CONFIG_KSU_' out/.config || true
               exit 1
             fi
@@ -750,6 +794,7 @@ jobs:
       # --------------------------------------------------
 
       - name: Build kernel
+        id: build-kernel
         run: |
           set -euo pipefail
 
@@ -784,6 +829,13 @@ jobs:
 
           ccache -s
 
+      - name: Save ccache
+        if: always() && steps.build-kernel.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-stage-${{ inputs.susfs && 'b' || 'a' }}-${{ env.DEVICE_CODENAME }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Verify SUSFS in built kernel
         if: env.SUSFS_ENABLE == 'true'
         run: |
@@ -800,14 +852,14 @@ jobs:
           done
 
           grep -q "SUSFS_VERSION: ${SUSFS_EXPECTED_VERSION}" out/build.log || {
-            echo "::error::BakaSU failed to recognize SUSFS ${SUSFS_EXPECTED_VERSION}"
+            echo "::error::BakaSU failed to detect SUSFS ${SUSFS_EXPECTED_VERSION}"
             exit 1
-          }
+          fi
 
           test -f out/fs/susfs.o || {
             echo "::error::out/fs/susfs.o does not exist, SUSFS was not compiled"
             exit 1
-          }
+          fi
 
           if strings out/vmlinux | grep -q "susfs is initialized! version: ${SUSFS_EXPECTED_VERSION}"; then
             echo "vmlinux contains: susfs is initialized! version: ${SUSFS_EXPECTED_VERSION}"
@@ -859,6 +911,9 @@ jobs:
             AnyKernel3
 
           cd AnyKernel3
+          ANYKERNEL_SHA="$(git rev-parse HEAD)"
+          echo "ANYKERNEL_SHA=${ANYKERNEL_SHA}" >> "${GITHUB_ENV}"
+          echo "AnyKernel3 SHA=${ANYKERNEL_SHA}"
 
           rm -rf \
             .git \
@@ -956,6 +1011,12 @@ jobs:
             echo "| Kernel SHA | \`${KERNEL_SHA:-n/a}\` |"
             echo "| BakaSU requested | \`${BAKASU_REF}\` |"
             echo "| BakaSU actual HEAD | \`${BAKASU_HEAD:-n/a}\` |"
+            if [ "${{ inputs.build_bakasu }}" = "true" ]; then
+              echo "| Manager APK | built from \`${BAKASU_MANAGER_SHA:-n/a}\` |"
+            else
+              echo "| Manager APK | skipped by input |"
+            fi
+            echo "| AnyKernel3 SHA | \`${ANYKERNEL_SHA:-unknown}\` |"
             echo "| Clang SHA | \`${CLANG_SHA:-unknown}\` |"
             echo "| Hook | ${HOOK} |"
             echo "| SUSFS | ${SUSFS_ROW} |"
@@ -967,7 +1028,7 @@ jobs:
             echo "| LOCALVERSION | ${LOCALVERSION:-n/a} |"
             echo "| Clean build | ${CLEAN_BUILD} |"
             echo ""
-            echo "Clang cache key: clang-proton-${CLANG_BRANCH}-v1"
+            echo "Clang cache key: clang-proton-${CLANG_SHA}-v1 (resolved commit-pinned cache)"
             echo ""
             echo "ARM32 GCC toolchain was not explicitly installed."
             echo "Check build.log if compat VDSO or ARM32 toolchain errors occur."
